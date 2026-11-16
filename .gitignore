@@ -1,0 +1,59 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env.production
+*.db
+*.db-journal
+prisma/migrations/
+.vercel
+coverage/
+.claude/
+
+# Secrets & credentials — NEVER commit
+certs/
+*.pem
+*.p12
+*.pfx
+prisma/*.json
+
+# Log files
+server.log
+server.err
+*.log
+
+# SWAT team orchestration files
+.swat/
+
+# Playwright
+e2e/.auth/
+test-results/
+playwright-report/
+
+# Private operational instructions and generated/editor state
+.vscode/
+*.tsbuildinfo
+BOSS_INSTRUCTIONS.md
+DEPLOY_VPS.md
+SETUP_INSTRUCTIONS_FOR_BOSS.md
+*.db
+*.sqlite
+
+# Local state never belongs in a portfolio snapshot
+.env
+.env.local
+.env.production
+node_modules/
+.venv/
+__pycache__/
+.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+*.tsbuildinfo
+.DS_Store
+
+!.env.example
+
+!.env.example

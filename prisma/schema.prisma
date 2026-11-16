@@ -1,0 +1,528 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Database provider setup:
+// - Local dev uses SQLite:      set DATABASE_URL="file:./dev.db" in .env (default)
+// - Production uses PostgreSQL: change provider to "postgresql" below
+//   and set DATABASE_URL="postgresql://user:password@host:5432/kpi_tracking"
+// See DEPLOY_VPS.md Step 5 for production setup instructions.
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Tenant ───────────────────────────────────────────────
+
+model Tenant {
+  id              String   @id @default(cuid())
+  slug            String   @unique
+  name            String
+  internalDomains String   @default("[]")
+  isDemoMode      Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  hubspotAccessToken  String?
+  azureAdTenantId     String?
+  azureAdClientId     String?
+  azureAdClientSecret String?
+  teamsWebhookUrl     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users              User[]
+  calendarEvents     CalendarEvent[]
+  partnerEntities    PartnerEntity[]
+  pipelineDefinitions PipelineDefinition[]
+  pipelineStages     PipelineStage[]
+  hubSpotDeals       HubSpotDeal[]
+  targetConfigs      TargetConfig[]
+  integrationConfigs IntegrationConfig[]
+  syncLogs           SyncLog[]
+  anomalies          Anomaly[]
+  reminderConfigs    ReminderConfig[]
+  auditLogs          AuditLog[]
+  kpiSnapshots       KPISnapshot[]
+  pipelineSnapshots  PipelineSnapshot[]
+  meetingReviews     MeetingReview[]
+  meetingDealAttributions MeetingDealAttribution[]
+  classificationFeedback ClassificationFeedback[]
+  suggestedClassifications SuggestedClassification[]
+  eventAttendees     EventAttendee[]
+  savedCharts        SavedChart[]
+}
+
+// ─── Auth & Users ──────────────────────────────────────────
+
+model User {
+  id             String    @id @default(cuid())
+  tenantId       String
+  email          String
+  name           String?
+  passwordHash   String
+  role           String    @default("rep") // rep | manager | admin
+  isActive       Boolean   @default(true)
+  sessionVersion Int       @default(0) // bump on deactivation / password change to invalidate JWTs
+  outlookEmail   String?   // email used for Graph API calendar
+  hubspotOwnerId String?   // mapped HubSpot owner ID
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  tenant         Tenant    @relation(fields: [tenantId], references: [id])
+  meetingReviews MeetingReview[]
+  auditLogs      AuditLog[]
+  calendarEvents CalendarEvent[]
+  targetConfigs  TargetConfig[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+}
+
+// ─── Calendar & Meetings ───────────────────────────────────
+
+model CalendarEvent {
+  id               String    @id @default(cuid())
+  tenantId         String
+  externalId       String // Graph API event ID
+  userId           String
+  subject          String?
+  bodyPreview      String?
+  startTime        DateTime
+  endTime          DateTime
+  duration         Int       // minutes
+  isAllDay         Boolean   @default(false)
+  isCancelled      Boolean   @default(false)
+  isRecurring      Boolean   @default(false)
+  recurrenceId     String?   // series master ID
+  organizer        String?   // email
+  organizerName    String?
+  location         String?
+  onlineMeetingUrl String?
+  status           String    @default("pending") // pending | completed | cancelled | noshow
+  rawJson          String?
+
+  // De-duplication: hash(organizer + startTime + subject) so the same
+  // physical meeting synced from multiple users' calendars can be linked.
+  meetingFingerprint String?
+
+  // Filtering flags
+  isInternal  Boolean @default(false)
+  isSolo      Boolean @default(false)
+  isFiltered  Boolean @default(false) // true = excluded from review
+  filterReason String?
+
+  syncedAt  DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant         Tenant                   @relation(fields: [tenantId], references: [id])
+  user           User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attendees      EventAttendee[]
+  review         MeetingReview?
+  suggestedClass SuggestedClassification?
+  attributions   MeetingDealAttribution[]
+
+  @@unique([tenantId, externalId])
+  @@index([tenantId])
+  @@index([userId, startTime])
+  @@index([userId])
+  @@index([status])
+  @@index([isFiltered])
+  @@index([isFiltered, startTime])
+  @@index([userId, isFiltered, startTime])
+  @@index([tenantId, isFiltered, startTime])
+  @@index([tenantId, userId, isFiltered, startTime])
+  @@index([tenantId, meetingFingerprint])
+}
+
+model EventAttendee {
+  id               String  @id @default(cuid())
+  tenantId         String
+  eventId          String
+  email            String
+  name             String?
+  responseStatus   String? // accepted | declined | tentative | none
+  isOrganizer      Boolean @default(false)
+  isInternal       Boolean @default(false)
+  isPartnerContact Boolean @default(false)
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id])
+  event  CalendarEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, email]) // enables upsert instead of delete-recreate
+  @@index([tenantId])
+  @@index([tenantId, eventId])
+  @@index([eventId])
+  @@index([email])
+  @@index([eventId, isInternal])
+  @@index([tenantId, isInternal])
+}
+
+model SuggestedClassification {
+  id             String @id @default(cuid())
+  tenantId       String
+  eventId        String @unique
+  suggestedLabel String // discovery_call | partnership_lead | irrelevant
+  confidence     Float  // 0.0 to 1.0
+  reasoning      String?
+  signals        String? // JSON array of signal details
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id])
+  event  CalendarEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, confidence])
+}
+
+model MeetingReview {
+  id             String   @id @default(cuid())
+  tenantId       String
+  eventId        String   @unique
+  userId         String
+  confirmedLabel String   // discovery_call | partnership_lead | irrelevant
+  source         String?  // linkedin | email | referral | partner | other
+  partnerName    String?
+  notes          String?
+  reviewedAt     DateTime @default(now())
+
+  partnerEvidence String? // JSON: { referral, attendeeMatch, hubspotSource, manualTag }
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id])
+  event  CalendarEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user   User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([confirmedLabel])
+  @@index([reviewedAt])
+  @@index([tenantId, confirmedLabel])
+  @@index([tenantId, eventId])
+}
+
+// ─── Classification Feedback (learning from manual reviews) ─
+
+model ClassificationFeedback {
+  id             String   @id @default(cuid())
+  tenantId       String
+  eventId        String
+  suggestedLabel String
+  confirmedLabel String
+  signals        String?  // JSON: the signals that were active at suggestion time
+  createdAt      DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([suggestedLabel, confirmedLabel])
+}
+
+// ─── Partners ──────────────────────────────────────────────
+
+model PartnerEntity {
+  id            String   @id @default(cuid())
+  tenantId      String
+  name          String
+  domain        String?
+  contactEmails String   @default("[]") // JSON array of email strings
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, domain])
+  @@index([tenantId])
+}
+
+// ─── HubSpot Pipeline ──────────────────────────────────────
+
+model PipelineDefinition {
+  id        String   @id @default(cuid())
+  tenantId  String
+  hubspotId String
+  label     String
+  isActive  Boolean  @default(true)
+  syncedAt  DateTime @default(now())
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id])
+  stages PipelineStage[]
+
+  @@unique([tenantId, hubspotId])
+  @@index([tenantId])
+}
+
+model PipelineStage {
+  id           String  @id @default(cuid())
+  tenantId     String
+  pipelineId   String
+  hubspotId    String
+  label        String
+  displayOrder Int
+  probability  Float?
+  isClosed     Boolean @default(false)
+  isWon        Boolean @default(false)
+
+  tenant       Tenant             @relation(fields: [tenantId], references: [id])
+  pipeline     PipelineDefinition @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  dealsAtStage HubSpotDeal[]
+
+  @@unique([tenantId, hubspotId])
+  @@index([tenantId])
+  @@index([pipelineId, displayOrder])
+}
+
+model HubSpotDeal {
+  id                String    @id @default(cuid())
+  tenantId          String
+  hubspotId         String
+  name              String
+  amount            Float?
+  currency          String?   @default("USD")
+  stageId           String
+  pipelineHubspotId String
+  ownerId           String?
+  ownerEmail        String?
+  contactId         String?
+  contactEmail      String?   // for attribution matching
+  companyId         String?
+  companyDomain     String?   // for attribution matching
+  closeDate         DateTime?
+  createDate        DateTime?
+  lastModified      DateTime?
+  isClosed          Boolean   @default(false)
+  isWon             Boolean   @default(false)
+  rawJson           String?
+
+  syncedAt  DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant       Tenant                 @relation(fields: [tenantId], references: [id])
+  stage        PipelineStage          @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  attributions MeetingDealAttribution[]
+
+  @@unique([tenantId, hubspotId])
+  @@index([tenantId])
+  @@index([stageId])
+  @@index([ownerId])
+  @@index([createDate])
+  @@index([contactEmail])
+  @@index([companyDomain])
+}
+
+// ─── Meeting-to-Deal Attribution ───────────────────────────
+
+model MeetingDealAttribution {
+  id              String   @id @default(cuid())
+  tenantId        String
+  eventId         String
+  dealId          String
+  attributionType String   // attendee_match | domain_proximity | manual
+  confidence      Float    // 0-1
+  createdAt       DateTime @default(now())
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id])
+  event  CalendarEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  deal   HubSpotDeal   @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, dealId])
+  @@index([tenantId])
+  @@index([eventId])
+  @@index([dealId])
+}
+
+// ─── Pipeline Snapshots (for trend tracking) ───────────────
+
+model PipelineSnapshot {
+  id           String   @id @default(cuid())
+  tenantId     String
+  pipelineId   String
+  stageId      String
+  dealCount    Int
+  totalValue   Float?
+  snapshotDate DateTime
+  createdAt    DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([pipelineId, snapshotDate])
+  @@index([stageId])
+}
+
+// ─── KPI Snapshots (for historical comparison) ─────────────
+
+model KPISnapshot {
+  id                 String   @id @default(cuid())
+  tenantId           String
+  userId             String?  // null = team level
+  period             String   // weekly | monthly | quarterly
+  periodStart        DateTime
+  outboundMeetings   Int
+  partnerMeetings    Int
+  classificationRate Float
+  createdAt          DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, userId, period, periodStart])
+  @@index([tenantId])
+  @@index([periodStart])
+}
+
+// ─── Targets & Goals ───────────────────────────────────────
+
+model TargetConfig {
+  id          String    @id @default(cuid())
+  tenantId    String
+  userId      String?   // null = team-level target
+  metricType  String    // outbound_meetings | partner_meetings | conversion_rate
+  stageId     String?   // for conversion targets, which stage
+  targetValue Float
+  period      String    // weekly | monthly | quarterly
+  periodStart DateTime? // specific period start, null = rolling
+  isActive    Boolean   @default(true)
+  createdBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User?  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([metricType, period])
+  @@index([userId])
+}
+
+// ─── Sync & Integration ────────────────────────────────────
+
+model IntegrationConfig {
+  id              String    @id @default(cuid())
+  tenantId        String
+  provider        String // microsoft_graph | hubspot
+  isEnabled       Boolean   @default(false)
+  lastSyncAt      DateTime?
+  syncIntervalMin Int       @default(60)
+  deltaLink       String?   // Graph API delta token for incremental sync
+  config          String?   // JSON for provider-specific config
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, provider])
+  @@index([tenantId])
+}
+
+model SyncLog {
+  id               String    @id @default(cuid())
+  tenantId         String
+  provider         String
+  syncType         String    // full | incremental
+  status           String    // started | completed | failed
+  recordsProcessed Int       @default(0)
+  recordsCreated   Int       @default(0)
+  recordsUpdated   Int       @default(0)
+  recordsSkipped   Int       @default(0)
+  errorMessage     String?
+  errorDetails     String?
+  startedAt        DateTime  @default(now())
+  completedAt      DateTime?
+  durationMs       Int?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([provider, startedAt])
+  @@index([status])
+  @@index([tenantId, provider, status, startedAt])
+}
+
+// ─── Anomalies & Data Quality ──────────────────────────────
+
+model Anomaly {
+  id                String    @id @default(cuid())
+  tenantId          String
+  type              String
+  severity          String    // info | warning | critical
+  title             String
+  description       String
+  affectedEntity    String?
+  affectedId        String?
+  recommendedAction String?
+  isResolved        Boolean   @default(false)
+  resolvedAt        DateTime?
+  resolvedBy        String?
+  createdAt         DateTime  @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([type, severity])
+  @@index([isResolved])
+  @@index([createdAt])
+  @@index([type, affectedId, isResolved])
+  @@index([isResolved, severity, createdAt])
+}
+
+// ─── Reminders ─────────────────────────────────────────────
+
+model ReminderConfig {
+  id              String    @id @default(cuid())
+  tenantId        String
+  type            String    // teams_classification_reminder
+  cronExpression  String    @default("0 16 * * 5") // Fri 4PM
+  isEnabled       Boolean   @default(true)
+  messageTemplate String?
+  lastSentAt      DateTime?
+  targetChannel   String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+}
+
+// ─── Saved Charts (Insights) ─────────────────────────────
+
+model SavedChart {
+  id          String   @id @default(cuid())
+  tenantId    String
+  userId      String
+  title       String
+  description String?
+  config      String   // JSON-serialized ChartConfig
+  position    Int      @default(0)
+  isPinned    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([userId, position])
+}
+
+// ─── Audit ─────────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String?
+  action    String
+  entity    String?
+  entityId  String?
+  details   String?  // JSON
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([tenantId, action])
+  @@index([userId, createdAt])
+  @@index([action])
+}
